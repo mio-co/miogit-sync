@@ -23,12 +23,12 @@ sides, and only when they differ fetch both into a cached bare repository and pu
   visibility and the `miogit-sync` topic. A GitHub repository without a MioGit twin is created on
   MioGit only if it was created after `since` (or carries the topic) – older GitHub-only repositories are reported, not imported.
 - **Existing GitHub repository of the same name**: linked only if it already has the topic, is empty,
-  or shares history (a common sha / merge base). Otherwise it is left alone and the run goes red.
+  or shares history (a common sha / merge base). Otherwise it is left alone (warning).
   A name that GitHub redirects to a renamed repository is never touched.
-- **Branches**: fast-forward only, never forced. Diverged → skipped, run red.
-- **Tags**: never moved. Same tag on different objects → skipped, run red.
+- **Branches**: fast-forward only, never forced. Diverged → skipped with a `::warning` (the job stays green, so no “Run failed” mail); the unmasked details show in the MioGit console under the repository's sync switch.
+- **Tags**: never moved. Same tag on different objects → skipped, warning.
 - **Deleting a branch / tag**: copied only while the other side still has exactly the sha of the
-  last sync (push with `--force-with-lease=<ref>:<sha>`); otherwise red. Default branches are never deleted.
+  last sync (push with `--force-with-lease=<ref>:<sha>`); otherwise a warning. Default branches are never deleted.
 - **Deleting a repository**: never copied, and the remaining copy is not re-created on the side
   where it was deleted (notice only).
 - **Visibility**: the side that changed since the last sync wins; unknown / both changed → private.
@@ -38,6 +38,12 @@ sides, and only when they differ fetch both into a cached bare repository and pu
 
 State (last synced sha per ref, visibility, link) is stored in MioGit (Registry settings) through
 `/~sync/api/state/<repo>`.
+
+Only real errors (GitHub / MioGit API or git failures, crashes) fail the job.
+
+This repository is public (free Actions minutes): logs and summaries print every repository that is
+not public on both sides as `private-<8 hex>` (HMAC of the name keyed with the sync token), and
+branch/tag names of those repositories likewise. Full details are stored in MioGit.
 
 ## Secrets
 
