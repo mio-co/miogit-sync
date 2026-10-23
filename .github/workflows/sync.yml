@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       repo:
-        description: "MioGit repository name (empty = reconcile everything)"
+        description: "MioGit repository name (empty = reconcile everything; shown publicly in the run)"
         required: false
         default: ""
       dry_run:
@@ -23,9 +23,11 @@ permissions:
 
 # One run per repository at a time. A newer event for the same repository
 # replaces a queued one, which is fine: every run syncs the repository's whole
-# current state, not just the refs in its event.
+# current state, not just the refs in its event. This repository is public, so
+# the group / cache key is the Worker's keyed hash of the name ("group"), never
+# the name; logs mask private repository names (sync.py Report).
 concurrency:
-  group: sync-${{ github.event.client_payload.repo || inputs.repo || 'reconcile' }}
+  group: sync-${{ github.event.client_payload.group || (inputs.repo != '' && 'manual') || 'reconcile' }}
   cancel-in-progress: false
 
 jobs:
@@ -43,12 +45,12 @@ jobs:
           persist-credentials: false
 
       - name: Restore repository cache
-        if: github.event_name == 'repository_dispatch'
+        if: github.event_name == 'repository_dispatch' && github.event.client_payload.group != ''
         uses: actions/cache@v4
         with:
           path: .cache/repo
-          key: repo-${{ github.event.client_payload.repo }}-${{ github.run_id }}
-          restore-keys: repo-${{ github.event.client_payload.repo }}-
+          key: repo-${{ github.event.client_payload.group }}-${{ github.run_id }}
+          restore-keys: repo-${{ github.event.client_payload.group }}-
 
       - name: Sync one repository (event)
         if: github.event_name == 'repository_dispatch'
