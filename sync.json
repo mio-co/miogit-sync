@@ -1,0 +1,10 @@
+{
+  "org": "mio-co",
+  "miogit_url": "https://miogit.300031.xyz",
+  "topic": "miogit-sync",
+  "since": "2026-10-23T07:30:00Z",
+  "aliases": {
+    "MioGit": "miogit"
+  },
+  "exclude": ["miogit-sync", ".github"]
+}
