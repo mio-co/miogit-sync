@@ -46,7 +46,7 @@ jobs:
 
       - name: Restore repository cache
         if: github.event_name == 'repository_dispatch' && github.event.client_payload.group != ''
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: .cache/repo
           key: repo-${{ github.event.client_payload.group }}-${{ github.run_id }}
