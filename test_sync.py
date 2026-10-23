@@ -268,6 +268,7 @@ class RepoRuns(unittest.TestCase):
             print(sy.r.summary(masked=True))
         out = buf.getvalue()
         self.assertNotIn("secretproj", out.lower())
+        self.assertNotIn("refs/heads/main -> GitHub", out.split("OpenProj")[0] if False else "\n".join(l for l in out.splitlines() if "private-" in l))
         self.assertIn("private-", out)
         self.assertIn("OpenProj", out)
         self.assertIn("SecretProj: created org/SecretProj (private)", sy.r.summary(masked=False))
