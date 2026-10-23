@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -54,32 +56,71 @@ HERE = Path(__file__).resolve().parent
 
 @dataclass
 class Report:
-    """conflicts fail the run (red); notices are informational."""
+    """conflicts fail the run (red); notices are informational.
+
+    mio-co/miogit-sync is a public repository, so its logs and run summaries are
+    public: every repository name that is not public on both sides is printed
+    as "private-<8 hex>" (an HMAC of the name keyed with the sync token, stable
+    but not guessable). The full, unmasked lines go to MioGit (per-repository
+    state + the run report, see MioGit.put_report) and show in the console."""
 
     conflicts: list[str] = field(default_factory=list)
     notices: list[str] = field(default_factory=list)
     actions: list[str] = field(default_factory=list)
+    by_repo: dict[str, list[str]] = field(default_factory=dict)  # unmasked conflicts per MioGit name
+    salt: bytes = b""
+    public: set[str] = field(default_factory=set)  # lower-case names public on every side
+    names: set[str] = field(default_factory=set)  # lower-case names seen (masked unless public)
+
+    def register(self, name: str | None, public: bool = False) -> None:
+        if not name:
+            return
+        low = name.lower()
+        self.names.add(low)
+        if public:
+            self.public.add(low)
+        else:
+            self.public.discard(low)
+
+    def label(self, name: str) -> str:
+        if name.lower() in self.public:
+            return name
+        return "private-" + hmac.new(self.salt, name.lower().encode(), hashlib.sha256).hexdigest()[:8]
+
+    def mask(self, text: str) -> str:
+        for low in sorted(self.names - self.public, key=len, reverse=True):
+            text = re.sub(r"(?<![A-Za-z0-9._-])" + re.escape(low) + r"(?![A-Za-z0-9_-])", self.label(low), text, flags=re.I)
+        return text
+
+    def _line(self, repo: str, msg: str) -> tuple[str, str]:
+        if repo.lower() not in self.names:
+            self.register(repo)
+        full = f"{repo}: {msg}"
+        return full, self.mask(f"{self.label(repo)}: {msg}")
 
     def conflict(self, repo: str, msg: str) -> None:
-        line = f"{repo}: {msg}"
-        self.conflicts.append(line)
-        print(f"::warning title=sync conflict::{line}", flush=True)
+        full, shown = self._line(repo, msg)
+        self.conflicts.append(full)
+        self.by_repo.setdefault(repo, []).append(msg)
+        print(f"::warning title=sync conflict::{shown}", flush=True)
 
     def notice(self, repo: str, msg: str) -> None:
-        line = f"{repo}: {msg}"
-        self.notices.append(line)
-        print(f"::notice::{line}", flush=True)
+        full, shown = self._line(repo, msg)
+        self.notices.append(full)
+        print(f"::notice::{shown}", flush=True)
 
     def did(self, repo: str, msg: str) -> None:
-        line = f"{repo}: {msg}"
-        self.actions.append(line)
-        print(f"  {line}", flush=True)
+        full, shown = self._line(repo, msg)
+        self.actions.append(full)
+        print(f"  {shown}", flush=True)
 
-    def summary(self) -> str:
+    def summary(self, masked: bool = True) -> str:
         out = ["## MioGit ⇄ GitHub sync", ""]
+        if masked:
+            out += ["Private repository names are masked here; the full report is in the MioGit console (repository settings).", ""]
         for title, items in (("Conflicts (skipped, need a human)", self.conflicts), ("Done", self.actions), ("Notices", self.notices)):
             out.append(f"### {title} ({len(items)})")
-            out += [f"- {x}" for x in items] or ["- none"]
+            out += [f"- {self.mask(x) if masked else x}" for x in items] or ["- none"]
             out.append("")
         return "\n".join(out)
 
@@ -283,6 +324,9 @@ class MioGit:
     def put_state(self, name: str, state: dict) -> None:
         self._call("PUT", f"/state/{name}", state)
 
+    def put_report(self, report: dict) -> None:
+        self._call("PUT", "/report", report)
+
 
 # ---- git -------------------------------------------------------------------------------
 
@@ -422,6 +466,18 @@ class Syncer:
     def __init__(self, cfg: Config, gh: GitHub, mg: MioGit, cache: Path, report: Report, dry: bool = False, single_cache: bool = False):
         self.cfg, self.gh, self.mg, self.cache, self.r, self.dry, self.single_cache = cfg, gh, mg, cache, report, dry, single_cache
 
+    def save_conflicts(self, mname: str, state: dict | None) -> None:
+        """record this run's conflicts (unmasked) on a repository the run stopped early on"""
+        if self.dry:
+            return
+        st = dict(state or {"linked": False})
+        st["conflicts"] = list(self.r.by_repo.get(mname, []))
+        st["at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        try:
+            self.mg.put_state(mname, st)
+        except HttpError:
+            pass
+
     def local(self, gname: str) -> Local:
         return Local(self.cache if self.single_cache else self.cache / f"{gname.lower()}.git")
 
@@ -429,6 +485,12 @@ class Syncer:
         cfg, r = self.cfg, self.r
         if gname.lower() in cfg.exclude:
             return
+        # names are masked in the public log unless the repository is public everywhere it exists
+        m_pub = mrepo is None or (not mrepo.get("deleted") and mrepo.get("private") is False)
+        g_pub = grepo is None or grepo.get("private") is False
+        pub = bool(mrepo or grepo) and m_pub and g_pub
+        for n in (mname, gname, (grepo or {}).get("name")):
+            r.register(n, pub)
         if not NAME_RE.match(mname) or not NAME_RE.match(gname):
             r.notice(gname, "name cannot be used on MioGit; skipped")
             return
@@ -498,6 +560,7 @@ class Syncer:
                 ok = lc.related(heads(m_refs), heads(g_refs))
             if not ok:
                 r.conflict(mname, f"{cfg.org}/{gname} already exists and shares no history with MioGit; not syncing it")
+                self.save_conflicts(mname, state)
                 return
             if not self.dry and cfg.topic not in topics:
                 self.gh.add_topic(gname, cfg.topic)
@@ -579,6 +642,7 @@ class Syncer:
             "github": f"{cfg.org}/{gname}",
             "private": m_priv if m_priv == g_priv else (state or {}).get("private"),
             "refs": next_state_refs(m_refs, g_refs, s_refs),
+            "conflicts": list(r.by_repo.get(mname, [])),
         }
         old_cmp = {k: v for k, v in (state or {}).items() if k != "at"}
         if new_state != old_cmp:
@@ -593,9 +657,25 @@ def after_since(grepo: dict, since: str) -> bool:
     return bool(since) and (grepo.get("created_at") or "") >= since
 
 
+def pre_register(r: Report, mrepos: list[dict], grepos: list[dict]) -> None:
+    """mask every name up front; a name is public only if no side lists it as private / deleted"""
+    pub: dict[str, bool] = {}
+    for x in mrepos:
+        low = x["name"].lower()
+        pub[low] = pub.get(low, True) and not x.get("deleted") and x.get("private") is False
+    for g in grepos:
+        low = g["name"].lower()
+        pub[low] = pub.get(low, True) and g.get("private") is False
+    for low, p in pub.items():
+        r.register(low, p)
+
+
 def run_repo(sy: Syncer, name: str, origin: str, miogit_hint: str | None = None) -> None:
     cfg = sy.cfg
+    sy.r.register(name)
+    sy.r.register(miogit_hint)
     mrepos = sy.mg.repos()
+    pre_register(sy.r, mrepos, [])
     by_name = {x["name"]: x for x in mrepos}
     if origin == "github":
         gname = name
@@ -604,6 +684,7 @@ def run_repo(sy: Syncer, name: str, origin: str, miogit_hint: str | None = None)
         mname = name
         gname = cfg.gh_name(mname)
     grepo = sy.gh.repo(gname)
+    pre_register(sy.r, mrepos, [grepo] if grepo else [])
     allow_import = origin == "github" and grepo is not None and (after_since(grepo, cfg.since) or cfg.topic in (grepo.get("topics") or []))
     sy.sync(mname, by_name.get(mname), gname, grepo, allow_import)
 
@@ -611,7 +692,9 @@ def run_repo(sy: Syncer, name: str, origin: str, miogit_hint: str | None = None)
 def run_reconcile(sy: Syncer) -> None:
     cfg = sy.cfg
     mrepos = sy.mg.repos()
-    grepos = {g["name"].lower(): g for g in sy.gh.repos()}
+    glist = sy.gh.repos()
+    pre_register(sy.r, mrepos, glist)
+    grepos = {g["name"].lower(): g for g in glist}
     seen: set[str] = set()
     lower_m: dict[str, str] = {}
     for m in sorted(mrepos, key=lambda x: x["name"]):
@@ -639,35 +722,15 @@ def run_reconcile(sy: Syncer) -> None:
             sy.r.conflict(g["name"], f"error: {e}")
 
 
-def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("mode", choices=["event", "repo", "reconcile"])
-    ap.add_argument("name", nargs="?")
-    ap.add_argument("--origin", choices=["miogit", "github"], default="miogit")
-    ap.add_argument("--config", default=str(HERE / "sync.json"))
-    ap.add_argument("--cache", default=".cache")
-    ap.add_argument("--dry-run", action="store_true")
-    a = ap.parse_args(argv)
-
-    cfg = Config.load(Path(a.config))
-    m_tok = os.environ.get("MIOGIT_SYNC_TOKEN", "")
-    g_tok = os.environ.get("GH_SYNC_PAT", "")
-    if not m_tok or not g_tok:
-        print("::error::MIOGIT_SYNC_TOKEN / GH_SYNC_PAT are not set (repository secrets)")
-        return 2
-    setup_git_auth(cfg.miogit_url, m_tok, cfg.github_git, g_tok)
-    report = Report()
-    gh = GitHub(cfg.org, g_tok, os.environ.get("GITHUB_API_BASE", "https://api.github.com"))
-    mg = MioGit(cfg.miogit_url, m_tok)
-
+def dispatch_mode(a, ap, cfg: Config, gh: GitHub, mg: MioGit, report: Report) -> None:
     if a.mode == "event":
         ev = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
         p = ev.get("client_payload") or {}
         name = str(p.get("repo") or "")
         origin = "github" if p.get("origin") == "github" else "miogit"
         if not NAME_RE.match(name):
-            print(f"::error::bad repository name in payload")
-            return 2
+            report.conflict("sync", "bad repository name in payload")
+            return
         sy = Syncer(cfg, gh, mg, Path(a.cache), report, a.dry_run, single_cache=True)
         hint = p.get("miogit") if isinstance(p.get("miogit"), str) else None
         try:
@@ -686,11 +749,54 @@ def main(argv: list[str] | None = None) -> int:
         sy = Syncer(cfg, gh, mg, Path(a.cache), report, a.dry_run)
         run_reconcile(sy)
 
-    summary = report.summary()
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("mode", choices=["event", "repo", "reconcile"])
+    ap.add_argument("name", nargs="?")
+    ap.add_argument("--origin", choices=["miogit", "github"], default="miogit")
+    ap.add_argument("--config", default=str(HERE / "sync.json"))
+    ap.add_argument("--cache", default=".cache")
+    ap.add_argument("--dry-run", action="store_true")
+    a = ap.parse_args(argv)
+
+    cfg = Config.load(Path(a.config))
+    m_tok = os.environ.get("MIOGIT_SYNC_TOKEN", "")
+    g_tok = os.environ.get("GH_SYNC_PAT", "")
+    if not m_tok or not g_tok:
+        print("::error::MIOGIT_SYNC_TOKEN / GH_SYNC_PAT are not set (repository secrets)")
+        return 2
+    setup_git_auth(cfg.miogit_url, m_tok, cfg.github_git, g_tok)
+    report = Report(salt=m_tok.encode())
+    gh = GitHub(cfg.org, g_tok, os.environ.get("GITHUB_API_BASE", "https://api.github.com"))
+    mg = MioGit(cfg.miogit_url, m_tok)
+
+    try:
+        dispatch_mode(a, ap, cfg, gh, mg, report)
+    except Exception as e:  # never let a traceback print unmasked names
+        report.conflict("sync", f"unexpected error: {type(e).__name__}: {e}")
+
+    summary = report.summary(masked=True)
     print(summary)
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
             f.write(summary + "\n")
+    if not a.dry_run and (report.conflicts or a.mode == "reconcile"):
+        run_url = ""
+        if os.environ.get("GITHUB_RUN_ID"):
+            run_url = f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/{os.environ.get('GITHUB_REPOSITORY', '')}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+        try:
+            mg.put_report({
+                "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "mode": a.mode,
+                "run": run_url,
+                "conflicts": report.conflicts[:200],
+                "actions": report.actions[:200],
+                "notices": report.notices[:200],
+            })
+        except (HttpError, OSError) as e:
+            print(f"::warning::could not store the full report in MioGit: {report.mask(str(e))}")
     return 1 if report.conflicts else 0
 
 
