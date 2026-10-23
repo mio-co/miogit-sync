@@ -203,6 +203,7 @@ class RepoRuns(unittest.TestCase):
         self.assertEqual(self.refs(self.mg.path("P"))["refs/heads/main"], m2)
         self.assertEqual(self.refs(self.gh.path("P"))["refs/heads/main"], g2)
         self.assertEqual(self.mg.states["P"]["refs"]["refs/heads/main"], base)  # last synced kept
+        self.assertEqual(self.report.errors, [])  # a divergence is a warning, not a failed job
 
     def test_unrelated_github_repo_with_same_name_is_left_alone(self):
         self.mg.create("Same", False, "")
