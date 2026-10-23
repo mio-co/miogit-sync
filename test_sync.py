@@ -220,7 +220,8 @@ class RepoRuns(unittest.TestCase):
         S.run_repo(self.syncer(), "Same", "miogit")
         self.assertTrue(any("shares no history" in c for c in self.report.conflicts))
         self.assertEqual(self.refs(self.gh.path("Same"))["refs/heads/main"], g)
-        self.assertNotIn("Same", self.mg.states)
+        self.assertFalse(self.mg.states["Same"]["linked"])  # not linked, conflict recorded for the console
+        self.assertIn("shares no history", self.mg.states["Same"]["conflicts"][0])
 
     def test_sync_off_does_nothing(self):
         self.mg.create("Off", False, "")
@@ -251,6 +252,25 @@ class RepoRuns(unittest.TestCase):
         S.run_reconcile(self.syncer())
         self.assertNotIn("Gone", self.gh.meta)
         self.assertTrue(any("deleted on GitHub" in n for n in self.report.notices))
+
+    def test_private_names_are_masked_in_the_public_log(self):
+        import contextlib, io
+        self.mg.create("SecretProj", True, "")
+        self.mg.create("OpenProj", False, "")
+        self.commit("x")
+        for n in ("SecretProj", "OpenProj"):
+            run("push", "-q", str(self.mg.path(n)), "HEAD:refs/heads/main", cwd=self.work)
+        sy = self.syncer()
+        sy.r.salt = b"k"
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            S.run_reconcile(sy)
+            print(sy.r.summary(masked=True))
+        out = buf.getvalue()
+        self.assertNotIn("secretproj", out.lower())
+        self.assertIn("private-", out)
+        self.assertIn("OpenProj", out)
+        self.assertIn("SecretProj: created org/SecretProj (private)", sy.r.summary(masked=False))
 
     def test_dry_run_changes_nothing(self):
         self.mg.create("Dry", False, "")
