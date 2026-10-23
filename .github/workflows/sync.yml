@@ -1,0 +1,63 @@
+# MioGit <-> GitHub two-way sync for every repository of mio-co.
+# Source of truth: sync/github/ in the MioGit repository (miogit.300031.xyz/MioGit).
+name: sync
+
+on:
+  repository_dispatch:
+    types: [miogit-push, github-push]
+  schedule:
+    - cron: "17 */6 * * *" # full reconcile: fills in anything a missed event left behind
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "MioGit repository name (empty = reconcile everything)"
+        required: false
+        default: ""
+      dry_run:
+        description: "print the plan only"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# One run per repository at a time. A newer event for the same repository
+# replaces a queued one, which is fine: every run syncs the repository's whole
+# current state, not just the refs in its event.
+concurrency:
+  group: sync-${{ github.event.client_payload.repo || inputs.repo || 'reconcile' }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      MIOGIT_SYNC_TOKEN: ${{ secrets.MIOGIT_SYNC_TOKEN }}
+      GH_SYNC_PAT: ${{ secrets.GH_SYNC_PAT }}
+      DRY_RUN: ${{ inputs.dry_run && '--dry-run' || '' }}
+      INPUT_REPO: ${{ inputs.repo }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Restore repository cache
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/cache@v4
+        with:
+          path: .cache/repo
+          key: repo-${{ github.event.client_payload.repo }}-${{ github.run_id }}
+          restore-keys: repo-${{ github.event.client_payload.repo }}-
+
+      - name: Sync one repository (event)
+        if: github.event_name == 'repository_dispatch'
+        run: python3 sync.py event --cache .cache/repo
+
+      - name: Sync one repository (manual)
+        if: github.event_name == 'workflow_dispatch' && inputs.repo != ''
+        run: python3 sync.py repo "$INPUT_REPO" $DRY_RUN
+
+      - name: Reconcile everything
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.repo == '')
+        run: python3 sync.py reconcile $DRY_RUN
