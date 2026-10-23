@@ -68,6 +68,7 @@ class Report:
     notices: list[str] = field(default_factory=list)
     actions: list[str] = field(default_factory=list)
     by_repo: dict[str, list[str]] = field(default_factory=dict)  # unmasked conflicts per MioGit name
+    shown: dict[str, list[str]] = field(default_factory=lambda: {"conflicts": [], "actions": [], "notices": []})  # masked, as printed
     salt: bytes = b""
     public: set[str] = field(default_factory=set)  # lower-case names public on every side
     names: set[str] = field(default_factory=set)  # lower-case names seen (masked unless public)
@@ -96,31 +97,38 @@ class Report:
         if repo.lower() not in self.names:
             self.register(repo)
         full = f"{repo}: {msg}"
+        if repo.lower() not in self.public:
+            # branch / tag names of a private repository stay private too
+            msg = re.sub(r"refs/(heads|tags)/[^\s:;,()]+", lambda m: f"refs/{m.group(1)}/" + self.label(m.group(0))[len("private-"):], msg)
         return full, self.mask(f"{self.label(repo)}: {msg}")
 
     def conflict(self, repo: str, msg: str) -> None:
         full, shown = self._line(repo, msg)
         self.conflicts.append(full)
+        self.shown["conflicts"].append(shown)
         self.by_repo.setdefault(repo, []).append(msg)
         print(f"::warning title=sync conflict::{shown}", flush=True)
 
     def notice(self, repo: str, msg: str) -> None:
         full, shown = self._line(repo, msg)
         self.notices.append(full)
+        self.shown["notices"].append(shown)
         print(f"::notice::{shown}", flush=True)
 
     def did(self, repo: str, msg: str) -> None:
         full, shown = self._line(repo, msg)
         self.actions.append(full)
+        self.shown["actions"].append(shown)
         print(f"  {shown}", flush=True)
 
     def summary(self, masked: bool = True) -> str:
         out = ["## MioGit ⇄ GitHub sync", ""]
         if masked:
             out += ["Private repository names are masked here; the full report is in the MioGit console (repository settings).", ""]
-        for title, items in (("Conflicts (skipped, need a human)", self.conflicts), ("Done", self.actions), ("Notices", self.notices)):
+        for title, key in (("Conflicts (skipped, need a human)", "conflicts"), ("Done", "actions"), ("Notices", "notices")):
+            items = self.shown[key] if masked else getattr(self, key)
             out.append(f"### {title} ({len(items)})")
-            out += [f"- {self.mask(x) if masked else x}" for x in items] or ["- none"]
+            out += [f"- {x}" for x in items] or ["- none"]
             out.append("")
         return "\n".join(out)
 
