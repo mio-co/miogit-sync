@@ -40,7 +40,7 @@ jobs:
       DRY_RUN: ${{ inputs.dry_run && '--dry-run' || '' }}
       INPUT_REPO: ${{ inputs.repo }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
 
