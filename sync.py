@@ -56,7 +56,10 @@ HERE = Path(__file__).resolve().parent
 
 @dataclass
 class Report:
-    """conflicts fail the run (red); notices are informational.
+    """conflicts (divergence, tag clash, refused delete, unrelated same-name repo)
+    are ::warning annotations and do NOT fail the job, so the owner does not get a
+    "Run failed" mail for every divergence; they are kept (unmasked) in MioGit and
+    shown in the console. Only errors (API / git failures, crashes) fail the job.
 
     mio-co/miogit-sync is a public repository, so its logs and run summaries are
     public: every repository name that is not public on both sides is printed
@@ -65,10 +68,11 @@ class Report:
     state + the run report, see MioGit.put_report) and show in the console."""
 
     conflicts: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
     notices: list[str] = field(default_factory=list)
     actions: list[str] = field(default_factory=list)
     by_repo: dict[str, list[str]] = field(default_factory=dict)  # unmasked conflicts per MioGit name
-    shown: dict[str, list[str]] = field(default_factory=lambda: {"conflicts": [], "actions": [], "notices": []})  # masked, as printed
+    shown: dict[str, list[str]] = field(default_factory=lambda: {"errors": [], "conflicts": [], "actions": [], "notices": []})  # masked, as printed
     salt: bytes = b""
     public: set[str] = field(default_factory=set)  # lower-case names public on every side
     names: set[str] = field(default_factory=set)  # lower-case names seen (masked unless public)
@@ -109,6 +113,14 @@ class Report:
         self.by_repo.setdefault(repo, []).append(msg)
         print(f"::warning title=sync conflict::{shown}", flush=True)
 
+    def error(self, repo: str, msg: str) -> None:
+        """a failure the sync could not handle: fails the job (red)"""
+        full, shown = self._line(repo, msg)
+        self.errors.append(full)
+        self.shown["errors"].append(shown)
+        self.by_repo.setdefault(repo, []).append(msg)
+        print(f"::error title=sync error::{shown}", flush=True)
+
     def notice(self, repo: str, msg: str) -> None:
         full, shown = self._line(repo, msg)
         self.notices.append(full)
@@ -125,7 +137,7 @@ class Report:
         out = ["## MioGit ⇄ GitHub sync", ""]
         if masked:
             out += ["Private repository names are masked here; the full report is in the MioGit console (repository settings).", ""]
-        for title, key in (("Conflicts (skipped, need a human)", "conflicts"), ("Done", "actions"), ("Notices", "notices")):
+        for title, key in (("Errors", "errors"), ("Conflicts (skipped, need a human)", "conflicts"), ("Done", "actions"), ("Notices", "notices")):
             items = self.shown[key] if masked else getattr(self, key)
             out.append(f"### {title} ({len(items)})")
             out += [f"- {x}" for x in items] or ["- none"]
@@ -718,7 +730,7 @@ def run_reconcile(sy: Syncer) -> None:
         try:
             sy.sync(mname, m, grepo["name"] if grepo else gname, grepo, allow_import=False)
         except (GitError, HttpError, OSError) as e:
-            sy.r.conflict(mname, f"error: {e}")
+            sy.r.error(mname, f"error: {e}")
     for key, g in sorted(grepos.items()):
         if key in seen or key in cfg.exclude:
             continue
@@ -727,7 +739,7 @@ def run_reconcile(sy: Syncer) -> None:
         try:
             sy.sync(mname, None, g["name"], g, allow_import=allow)
         except (GitError, HttpError, OSError) as e:
-            sy.r.conflict(g["name"], f"error: {e}")
+            sy.r.error(g["name"], f"error: {e}")
 
 
 def dispatch_mode(a, ap, cfg: Config, gh: GitHub, mg: MioGit, report: Report) -> None:
@@ -737,14 +749,14 @@ def dispatch_mode(a, ap, cfg: Config, gh: GitHub, mg: MioGit, report: Report) ->
         name = str(p.get("repo") or "")
         origin = "github" if p.get("origin") == "github" else "miogit"
         if not NAME_RE.match(name):
-            report.conflict("sync", "bad repository name in payload")
+            report.error("sync", "bad repository name in payload")
             return
         sy = Syncer(cfg, gh, mg, Path(a.cache), report, a.dry_run, single_cache=True)
         hint = p.get("miogit") if isinstance(p.get("miogit"), str) else None
         try:
             run_repo(sy, name, origin, hint)
         except (GitError, HttpError, OSError) as e:
-            report.conflict(name, f"error: {e}")
+            report.error(name, f"error: {e}")
     elif a.mode == "repo":
         if not a.name or not NAME_RE.match(a.name):
             ap.error("repo mode needs a repository name")
@@ -752,7 +764,7 @@ def dispatch_mode(a, ap, cfg: Config, gh: GitHub, mg: MioGit, report: Report) ->
         try:
             run_repo(sy, a.name, a.origin)
         except (GitError, HttpError, OSError) as e:
-            report.conflict(a.name, f"error: {e}")
+            report.error(a.name, f"error: {e}")
     else:
         sy = Syncer(cfg, gh, mg, Path(a.cache), report, a.dry_run)
         run_reconcile(sy)
@@ -783,14 +795,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         dispatch_mode(a, ap, cfg, gh, mg, report)
     except Exception as e:  # never let a traceback print unmasked names
-        report.conflict("sync", f"unexpected error: {type(e).__name__}: {e}")
+        report.error("sync", f"unexpected error: {type(e).__name__}: {e}")
 
     summary = report.summary(masked=True)
     print(summary)
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
             f.write(summary + "\n")
-    if not a.dry_run and (report.conflicts or a.mode == "reconcile"):
+    if not a.dry_run and (report.conflicts or report.errors or a.mode == "reconcile"):
         run_url = ""
         if os.environ.get("GITHUB_RUN_ID"):
             run_url = f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/{os.environ.get('GITHUB_REPOSITORY', '')}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
@@ -799,13 +811,15 @@ def main(argv: list[str] | None = None) -> int:
                 "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "mode": a.mode,
                 "run": run_url,
+                "errors": report.errors[:200],
                 "conflicts": report.conflicts[:200],
                 "actions": report.actions[:200],
                 "notices": report.notices[:200],
             })
         except (HttpError, OSError) as e:
             print(f"::warning::could not store the full report in MioGit: {report.mask(str(e))}")
-    return 1 if report.conflicts else 0
+    # divergence and other conflicts are warnings (no "Run failed" mail); only errors fail
+    return 1 if report.errors else 0
 
 
 if __name__ == "__main__":
