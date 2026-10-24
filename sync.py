@@ -648,20 +648,32 @@ class Syncer:
             changed |= ok
             (r.did(mname, f"deleted {ref} on MioGit (deleted on GitHub)") if ok else r.conflict(mname, f"delete {ref} on MioGit failed: {msg}"))
 
-        if created_g and m_head and m_head.startswith("refs/heads/") and changed:
-            try:
-                self.gh.set_default_branch(gname, m_head[len("refs/heads/"):])
-            except HttpError as e:
-                r.notice(mname, f"could not set the GitHub default branch: {e}")
-
         if changed:
-            _, m_refs = ls_remote(m_url)
-            _, g_refs = ls_remote(g_url)
+            m_head, m_refs = ls_remote(m_url)
+            g_head, g_refs = ls_remote(g_url)
+
+        # default branch: MioGit's HEAD is mirrored onto GitHub (new repository, a default
+        # changed in MioGit's settings, or no record yet). A default changed only on GitHub
+        # since the last run is left alone with a notice (MioGit HEAD is set on MioGit).
+        s_head = (state or {}).get("head")
+        head_now = m_head
+        if m_head and m_head != g_head and m_head.startswith("refs/heads/") and m_head in g_refs:
+            if created_g or s_head is None or s_head == g_head:
+                try:
+                    self.gh.set_default_branch(gname, m_head[len("refs/heads/"):])
+                    g_head = m_head
+                    r.did(mname, "GitHub default branch follows MioGit")
+                except HttpError as e:
+                    r.notice(mname, f"could not set the GitHub default branch: {e}")
+                    head_now = s_head
+            else:
+                r.notice(mname, "the default branch was changed on GitHub; MioGit keeps its own (change it in MioGit's settings)")
         new_state = {
             "linked": True,
             "github": f"{cfg.org}/{gname}",
             "private": m_priv if m_priv == g_priv else (state or {}).get("private"),
             "refs": next_state_refs(m_refs, g_refs, s_refs),
+            "head": head_now,
             "conflicts": list(r.by_repo.get(mname, [])),
         }
         old_cmp = {k: v for k, v in (state or {}).items() if k != "at"}
