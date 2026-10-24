@@ -113,6 +113,7 @@ class FakeGitHub:
 
     def set_default_branch(self, name, branch):
         self.meta[name]["default_branch"] = branch
+        run("symbolic-ref", "HEAD", f"refs/heads/{branch}", cwd=self.path(name))
 
     def add_topic(self, name, topic):
         if topic not in self.meta[name]["topics"]:
@@ -171,7 +172,7 @@ class RepoRuns(unittest.TestCase):
         self.assertEqual(self.report.conflicts, [])
         self.assertTrue(self.gh.meta["Proj"]["private"])
         self.assertIn("miogit-sync", self.gh.meta["Proj"]["topics"])
-        self.assertEqual(self.gh.meta["Proj"]["default_branch"], "main")
+        self.assertEqual(S.ls_remote(f"file://{self.gh.path('Proj')}")[0], "refs/heads/main")
         self.assertEqual(self.refs(self.gh.path("Proj")), {"refs/heads/main": c1, "refs/heads/dev": c1})
         self.assertEqual(self.mg.states["Proj"]["refs"], {"refs/heads/dev": c1, "refs/heads/main": c1})
 
@@ -185,6 +186,27 @@ class RepoRuns(unittest.TestCase):
         run("push", "-q", str(self.gh.path("Proj")), ":refs/heads/dev", cwd=self.work)
         S.run_repo(self.syncer(), "Proj", "github")
         self.assertNotIn("refs/heads/dev", self.refs(self.mg.path("Proj")))
+        self.assertEqual(self.report.conflicts, [])
+
+    def test_default_branch_change_on_miogit_follows_to_github(self):
+        self.mg.create("D", False, "")
+        self.commit("one")
+        run("push", "-q", str(self.mg.path("D")), "HEAD:refs/heads/main", "HEAD:refs/heads/dev", cwd=self.work)
+        run("symbolic-ref", "HEAD", "refs/heads/main", cwd=self.mg.path("D"))
+        S.run_repo(self.syncer(), "D", "miogit")
+        self.assertEqual(S.ls_remote(f"file://{self.gh.path('D')}")[0], "refs/heads/main")
+        self.assertEqual(self.mg.states["D"]["head"], "refs/heads/main")
+        # default changed in MioGit's settings -> GitHub follows
+        run("symbolic-ref", "HEAD", "refs/heads/dev", cwd=self.mg.path("D"))
+        S.run_repo(self.syncer(), "D", "miogit")
+        self.assertEqual(S.ls_remote(f"file://{self.gh.path('D')}")[0], "refs/heads/dev")
+        self.assertEqual(self.mg.states["D"]["head"], "refs/heads/dev")
+        self.assertEqual(self.report.conflicts, [])
+        # default changed only on GitHub -> MioGit and GitHub are left as they are
+        run("symbolic-ref", "HEAD", "refs/heads/main", cwd=self.gh.path("D"))
+        S.run_repo(self.syncer(), "D", "github")
+        self.assertEqual(S.ls_remote(f"file://{self.gh.path('D')}")[0], "refs/heads/main")
+        self.assertEqual(S.ls_remote(f"file://{self.mg.path('D')}")[0], "refs/heads/dev")
         self.assertEqual(self.report.conflicts, [])
 
     def test_divergence_is_reported_and_neither_side_changes(self):
